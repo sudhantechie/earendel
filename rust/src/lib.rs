@@ -1,0 +1,98 @@
+use std::convert::Infallible;
+
+use lazy_static::lazy_static;
+use pyo3::prelude::*;
+use pyo3_log::ResetHandle;
+
+pub mod acl;
+pub mod canonical_json;
+pub mod config;
+pub mod deferred;
+pub mod duration;
+pub mod errors;
+pub mod events;
+pub mod handlers;
+pub mod http;
+pub mod http_client;
+pub mod identifier;
+pub mod json;
+pub mod matrix_const;
+pub mod msc4388_rendezvous;
+pub mod push;
+pub mod rendezvous;
+pub mod room_versions;
+pub mod segmenter;
+pub mod storage;
+pub mod tokio_runtime;
+pub mod types;
+
+lazy_static! {
+    static ref LOGGING_HANDLE: ResetHandle = pyo3_log::init();
+}
+
+/// Returns the hash of all the rust source files at the time it was compiled.
+///
+/// Used by python to detect if the rust library is outdated.
+#[pyfunction]
+fn get_rust_file_digest() -> &'static str {
+    env!("EAREENDEL_RUST_DIGEST")
+}
+
+/// Returns the `rustc` version used when this native module was built.
+///
+/// This value is embedded at build time, so it can be exported as a prometheus metrics.
+#[pyfunction]
+pub fn get_rustc_version() -> &'static str {
+    env!("EAREENDEL_RUSTC_VERSION")
+}
+
+/// Formats the sum of two numbers as string.
+#[pyfunction]
+#[pyo3(text_signature = "(a, b, /)")]
+fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
+    Ok((a + b).to_string())
+}
+
+/// Reset the cached logging configuration of pyo3-log to pick up any changes
+/// in the Python logging configuration.
+///
+#[pyfunction]
+fn reset_logging_config() {
+    LOGGING_HANDLE.reset();
+}
+
+/// The entry point for defining the Python module.
+#[pymodule]
+fn earendel_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
+    m.add_function(wrap_pyfunction!(get_rust_file_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(get_rustc_version, m)?)?;
+    m.add_function(wrap_pyfunction!(reset_logging_config, m)?)?;
+
+    acl::register_module(py, m)?;
+    deferred::register_module(py, m)?;
+    push::register_module(py, m)?;
+    events::register_module(py, m)?;
+    handlers::register_module(py, m)?;
+    http_client::register_module(py, m)?;
+    rendezvous::register_module(py, m)?;
+    msc4388_rendezvous::register_module(py, m)?;
+    segmenter::register_module(py, m)?;
+    room_versions::register_module(py, m)?;
+    types::register_module(py, m)?;
+
+    Ok(())
+}
+
+pub trait UnwrapInfallible<T> {
+    fn unwrap_infallible(self) -> T;
+}
+
+impl<T> UnwrapInfallible<T> for Result<T, Infallible> {
+    fn unwrap_infallible(self) -> T {
+        match self {
+            Ok(val) => val,
+            Err(never) => match never {},
+        }
+    }
+}

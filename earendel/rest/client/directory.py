@@ -1,0 +1,216 @@
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
+# Copyright 2014-2016 OpenMarket Ltd
+# Copyright (C) 2023 New Vector, Ltd
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+#
+# Originally licensed under the Apache License, Version 2.0:
+# <http://www.apache.org/licenses/LICENSE-2.0>.
+#
+# [This file includes modifications made by New Vector Limited]
+#
+#
+
+import logging
+from typing import TYPE_CHECKING, Literal
+
+from pydantic import StrictStr
+
+from twisted.web.server import Request
+
+from earendel.api.errors import AuthError, Codes, NotFoundError, EarendelError
+from earendel.http.server import HttpServer
+from earendel.http.servlet import (
+    RestServlet,
+    parse_and_validate_json_object_from_request,
+)
+from earendel.http.site import EarendelRequest
+from earendel.rest.client._base import client_patterns
+from earendel.types import JsonDict, RoomAlias
+from earendel.types.rest import RequestBodyModel
+
+if TYPE_CHECKING:
+    from earendel.server import HomeServer
+
+logger = logging.getLogger(__name__)
+
+
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
+    ClientDirectoryServer(hs).register(http_server)
+    if hs.config.worker.worker_app is None:
+        ClientDirectoryListServer(hs).register(http_server)
+        ClientAppserviceDirectoryListServer(hs).register(http_server)
+
+
+class ClientDirectoryServer(RestServlet):
+    PATTERNS = client_patterns("/directory/room/(?P<room_alias>[^/]*)$", v1=True)
+    CATEGORY = "Client API requests"
+
+    def __init__(self, hs: "HomeServer"):
+        super().__init__()
+        self.store = hs.get_datastores().main
+        self.directory_handler = hs.get_directory_handler()
+        self.auth = hs.get_auth()
+
+    async def on_GET(self, request: Request, room_alias: str) -> tuple[int, JsonDict]:
+        if not RoomAlias.is_valid(room_alias):
+            raise EarendelError(400, "Room alias invalid", errcode=Codes.INVALID_PARAM)
+        room_alias_obj = RoomAlias.from_string(room_alias)
+
+        res = await self.directory_handler.get_association(room_alias_obj)
+
+        return 200, res
+
+    class PutBody(RequestBodyModel):
+        # TODO: get Pydantic to validate that this is a valid room id?
+        room_id: StrictStr
+        # `servers` is unspecced
+        servers: list[StrictStr] | None = None
+
+    async def on_PUT(
+        self, request: EarendelRequest, room_alias: str
+    ) -> tuple[int, JsonDict]:
+        if not RoomAlias.is_valid(room_alias):
+            raise EarendelError(400, "Room alias invalid", errcode=Codes.INVALID_PARAM)
+        room_alias_obj = RoomAlias.from_string(room_alias)
+
+        content = parse_and_validate_json_object_from_request(request, self.PutBody)
+
+        logger.debug("Got content: %s", content)
+        logger.debug("Got room name: %s", room_alias_obj.to_string())
+
+        logger.debug("Got room_id: %s", content.room_id)
+        logger.debug("Got servers: %s", content.servers)
+
+        room = await self.store.get_room(content.room_id)
+        if room is None:
+            raise EarendelError(400, "Room does not exist")
+
+        requester = await self.auth.get_user_by_req(request)
+
+        await self.directory_handler.create_association(
+            requester, room_alias_obj, content.room_id, content.servers
+        )
+
+        return 200, {}
+
+    async def on_DELETE(
+        self, request: EarendelRequest, room_alias: str
+    ) -> tuple[int, JsonDict]:
+        if not RoomAlias.is_valid(room_alias):
+            raise EarendelError(400, "Room alias invalid", errcode=Codes.INVALID_PARAM)
+        room_alias_obj = RoomAlias.from_string(room_alias)
+        requester = await self.auth.get_user_by_req(request)
+
+        app_service = (
+            self.store.get_app_service_by_id(requester.app_service_id)
+            if requester.app_service_id
+            else None
+        )
+        if app_service:
+            await self.directory_handler.delete_appservice_association(
+                app_service, room_alias_obj
+            )
+
+            logger.info(
+                "Application service at %s deleted alias %s",
+                app_service.url,
+                room_alias_obj.to_string(),
+            )
+
+        else:
+            await self.directory_handler.delete_association(requester, room_alias_obj)
+
+            logger.info(
+                "User %s deleted alias %s",
+                requester.user.to_string(),
+                room_alias_obj.to_string(),
+            )
+
+        return 200, {}
+
+
+class ClientDirectoryListServer(RestServlet):
+    PATTERNS = client_patterns("/directory/list/room/(?P<room_id>[^/]*)$", v1=True)
+
+    def __init__(self, hs: "HomeServer"):
+        super().__init__()
+        self.store = hs.get_datastores().main
+        self.directory_handler = hs.get_directory_handler()
+        self.auth = hs.get_auth()
+
+    async def on_GET(self, request: Request, room_id: str) -> tuple[int, JsonDict]:
+        room = await self.store.get_room(room_id)
+        if room is None:
+            raise NotFoundError("Unknown room")
+
+        return 200, {"visibility": "public" if room[0] else "private"}
+
+    class PutBody(RequestBodyModel):
+        visibility: Literal["public", "private"] = "public"
+
+    async def on_PUT(
+        self, request: EarendelRequest, room_id: str
+    ) -> tuple[int, JsonDict]:
+        requester = await self.auth.get_user_by_req(request)
+
+        content = parse_and_validate_json_object_from_request(request, self.PutBody)
+
+        await self.directory_handler.edit_published_room_list(
+            requester, room_id, content.visibility
+        )
+
+        return 200, {}
+
+
+class ClientAppserviceDirectoryListServer(RestServlet):
+    PATTERNS = client_patterns(
+        "/directory/list/appservice/(?P<network_id>[^/]*)/(?P<room_id>[^/]*)$", v1=True
+    )
+
+    def __init__(self, hs: "HomeServer"):
+        super().__init__()
+        self.store = hs.get_datastores().main
+        self.directory_handler = hs.get_directory_handler()
+        self.auth = hs.get_auth()
+
+    class PutBody(RequestBodyModel):
+        visibility: Literal["public", "private"] = "public"
+
+    async def on_PUT(
+        self, request: EarendelRequest, network_id: str, room_id: str
+    ) -> tuple[int, JsonDict]:
+        content = parse_and_validate_json_object_from_request(request, self.PutBody)
+        return await self._edit(request, network_id, room_id, content.visibility)
+
+    async def on_DELETE(
+        self, request: EarendelRequest, network_id: str, room_id: str
+    ) -> tuple[int, JsonDict]:
+        return await self._edit(request, network_id, room_id, "private")
+
+    async def _edit(
+        self,
+        request: EarendelRequest,
+        network_id: str,
+        room_id: str,
+        visibility: Literal["public", "private"],
+    ) -> tuple[int, JsonDict]:
+        requester = await self.auth.get_user_by_req(request)
+        if not requester.app_service_id:
+            raise AuthError(
+                403, "Only appservices can edit the appservice published room list"
+            )
+
+        await self.directory_handler.edit_published_appservice_room_list(
+            requester.app_service_id, network_id, room_id, visibility
+        )
+
+        return 200, {}

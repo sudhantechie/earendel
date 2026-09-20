@@ -1,0 +1,489 @@
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
+# Copyright (C) 2024 New Vector, Ltd
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+
+from typing import Any, Iterator, Mapping
+
+from earendel.earendel_rust.room_versions import RoomVersion
+from earendel.types import JsonDict, JsonMapping, Requester, StrSequence
+from earendel.util.duration import Duration
+
+class EventInternalMetadata:
+    def __init__(self, internal_metadata_dict: JsonDict): ...
+
+    stream_ordering: int | None
+    """the stream ordering of this event. None, until it has been persisted."""
+    instance_name: str | None
+    """the instance name of the server that persisted this event. None, until it has been persisted."""
+    redacted_by: str | None
+    """the event ID of the redaction event, if this event has been redacted. Set dynamically at load time, not persisted."""
+
+    outlier: bool
+    """whether this event is an outlier (ie, whether we have the state at that
+    point in the DAG)"""
+
+    out_of_band_membership: bool
+    send_on_behalf_of: str
+    recheck_redaction: bool
+    soft_failed: bool
+    proactively_send: bool
+    redacted: bool
+
+    policy_server_spammy: bool
+    """whether the policy server indicated that this event is spammy"""
+
+    spam_checker_spammy: bool
+    """Whether a spam checker module indicated that this event is spammy
+
+    Note that spam checkers also cause the event to be marked as soft-failed.
+
+    This flags exists for two reasons:
+        1. as debugging information
+        2. to prevent the soft-failed re-evaluation of spammy events
+           (the re-evaluation behaviour originates from MSC4354 Sticky Events)
+
+    Note that historical spammy events won't have this flag.
+    """
+
+    txn_id: str
+    """The transaction ID, if it was set when the event was created."""
+    delay_id: str
+    """The delay ID, set only if the event was a delayed event."""
+    token_id: int
+    """The access token ID of the user who sent this event, if any."""
+    device_id: str
+    """The device ID of the user who sent this event, if any."""
+
+    # MSC4242 state dags
+    calculated_auth_event_ids: list[str]
+
+    def get_dict(self) -> JsonDict: ...
+    def is_outlier(self) -> bool: ...
+    def copy(self) -> "EventInternalMetadata": ...
+    def is_out_of_band_membership(self) -> bool:
+        """Whether this event is an out-of-band membership.
+
+        OOB memberships are a special case of outlier events: they are membership events
+        for federated rooms that we aren't full members of. Examples include invites
+        received over federation, and rejections for such invites.
+
+        The concept of an OOB membership is needed because these events need to be
+        processed as if they're new regular events (e.g. updating membership state in
+        the database, relaying to clients via /sync, etc) despite being outliers.
+
+        See also https://github.com/sudhantechie/earendel/develop/development/room-dag-concepts.html#out-of-band-membership-events.
+
+        (Added in earendel 0.99.0, so may be unreliable for events received before that)
+        """
+
+    def get_send_on_behalf_of(self) -> str | None:
+        """Whether this server should send the event on behalf of another server.
+        This is used by the federation "send_join" API to forward the initial join
+        event for a server in the room.
+
+        returns a str with the name of the server this event is sent on behalf of.
+        """
+
+    def need_to_check_redaction(self) -> bool:
+        """Whether the redaction event needs to be rechecked when fetching
+        from the database.
+
+        Starting in room v3 redaction events are accepted up front, and later
+        checked to see if the redacter and redactee's domains match.
+
+        If the sender of the redaction event is allowed to redact any event
+        due to auth rules, then this will always return false.
+        """
+
+    def is_soft_failed(self) -> bool:
+        """Whether the event has been soft failed.
+
+        Soft failed events should be handled as usual, except:
+            1. They should not go down sync or event streams, or generally
+               sent to clients.
+            2. They should not be added to the forward extremities (and
+               therefore not to current state).
+        """
+
+    def should_proactively_send(self) -> bool:
+        """Whether the event, if ours, should be sent to other clients and
+        servers.
+
+        This is used for sending dummy events internally. Servers and clients
+        can still explicitly fetch the event.
+        """
+
+    def is_redacted(self) -> bool:
+        """Whether the event has been redacted.
+
+        This is used for efficiently checking whether an event has been
+        marked as redacted without needing to make another database call.
+        """
+
+    def is_notifiable(self) -> bool:
+        """Whether this event can trigger a push notification"""
+
+def event_visible_to_server(
+    sender: str,
+    target_server_name: str,
+    history_visibility: str,
+    erased_senders: Mapping[str, bool],
+    partial_state_invisible: bool,
+    memberships: list[tuple[str, str]],
+) -> bool:
+    """Determine whether the server is allowed to see the unredacted event.
+
+    Args:
+        sender: The sender of the event.
+        target_server_name: The server we want to send the event to.
+        history_visibility: The history_visibility value at the event.
+        erased_senders: A mapping of users and whether they have requested erasure. If a
+            user is not in the map, it is treated as though they haven't requested erasure.
+        partial_state_invisible: Whether the event should be treated as invisible due to
+            the partial state status of the room.
+        memberships: A list of membership state information at the event for users
+            matching the `target_server_name`. Each list item must contain a tuple of
+            (state_key, membership).
+
+    Returns:
+        Whether the server is allowed to see the unredacted event.
+    """
+
+class Signatures:
+    """A class representing the signatures on an event."""
+
+    def __init__(self, signatures: Mapping[str, Mapping[str, str]] | None = None): ...
+    def get_signature(self, server_name: str, key_id: str) -> str | None:
+        """Get the signature for the given server name and key ID, if it exists."""
+
+    def __getitem__(self, server_name: str) -> Mapping[str, str]:
+        """Get the signatures for the given server name. Raises KeyError if there
+        are no signatures for that server."""
+
+    def __contains__(self, server_name: Any) -> bool:
+        """Check if there are signatures for the given server name."""
+
+    def __len__(self) -> int:
+        """Return the number of servers that have signatures."""
+
+    def add_signature(self, server_name: str, key_id: str, signature: str) -> None:
+        """Add a signature for the given server name and key ID."""
+
+    def update(self, signatures: Mapping[str, Mapping[str, str]]) -> None:
+        """Update the signatures with the given signatures.
+
+        Will overwrite all existing signatures for the server names provided.
+        """
+
+    def as_dict(self) -> dict[str, dict[str, str]]:
+        """Return a copy of the signatures as a dictionary."""
+
+class Unsigned:
+    """A class representing the unsigned data of an event."""
+
+    def __init__(self, unsigned_json: str): ...
+    def __getitem__(self, key: str) -> Any:
+        """Get the value for the given key.
+
+        Raises KeyError if the key is unset or not recognised."""
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Set the value for the given key.
+
+        Raises KeyError if the key is not recognised."""
+
+    def __delitem__(self, key: str) -> None:
+        """Delete the value for the given key.
+
+        Raises KeyError if the key is unset or not recognised."""
+
+    def __contains__(self, key: Any) -> bool: ...
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get the value for the given key, or ``default`` if the key is unset."""
+
+    def for_persistence(self) -> JsonDict:
+        """Return a dict of the fields that should be persisted to the database."""
+
+    def for_event(self) -> JsonDict:
+        """Return a dict of all unsigned fields, including those only kept in
+        memory, suitable for inclusion in an event."""
+
+class JsonObject(Mapping[str, Any]):
+    """Immutable JSON object mapping."""
+
+    def __init__(self, content_dict: JsonMapping | None = None): ...
+    def __len__(self) -> int: ...
+    def __getitem__(self, key: str) -> Any: ...
+    def __iter__(self) -> Iterator[str]: ...
+    def __eq__(self, other: object) -> bool: ...
+
+class Event:
+    """Represents a Matrix event."""
+
+    def __init__(
+        self,
+        event_json: str,
+        room_version: RoomVersion,
+        internal_metadata_dict: JsonDict,
+        rejected_reason: str | None,
+    ) -> None: ...
+    def get_dict(self) -> JsonDict:
+        """Convert the event to a dictionary suitable for serialisation."""
+
+    def get_dict_for_persistence(self) -> JsonDict:
+        """Like ``get_dict``, but serializes ``unsigned`` in a form suitable for
+        persistence."""
+
+    def get_pdu_json(self, time_now: int | None = None) -> JsonDict:
+        """Like ``get_dict``, but serializes ``unsigned`` in a form suitable
+        for sending over federation."""
+
+    def get_templated_pdu_json(self) -> JsonDict:
+        """Like ``get_dict``, except strips fields like ``signatures``,
+        ``hashes`` and ``unsigned`` so that the result is suitable as a template for
+        creating new events. Used in make_{join,leave,knock} flows."""
+
+    @property
+    def event_id(self) -> str: ...
+    @property
+    def room_id(self) -> str: ...
+    @property
+    def signatures(self) -> Signatures: ...
+    @property
+    def content(self) -> JsonMapping: ...
+    @property
+    def depth(self) -> int: ...
+    @property
+    def hashes(self) -> dict[str, str]: ...
+    @property
+    def origin_server_ts(self) -> int: ...
+    @property
+    def sender(self) -> str: ...
+    @property
+    def state_key(self) -> str: ...
+    @property
+    def type(self) -> str: ...
+    @property
+    def unsigned(self) -> Unsigned: ...
+    @property
+    def internal_metadata(self) -> EventInternalMetadata: ...
+    @property
+    def rejected_reason(self) -> str | None: ...
+    @property
+    def room_version(self) -> RoomVersion: ...
+    @property
+    def format_version(self) -> int:
+        """The EventFormatVersion implemented by this event."""
+
+    @property
+    def membership(self) -> Any: ...
+    @property
+    def redacts(self) -> Any | None: ...
+    def prev_event_ids(self) -> StrSequence:
+        """Returns the list of prev event IDs."""
+
+    def auth_event_ids(self) -> StrSequence:
+        """Returns the list of auth event IDs"""
+
+    def is_state(self) -> bool: ...
+    def get_state_key(self) -> str | None:
+        """Get the state key of this event, or None if it's not a state event."""
+    def __contains__(self, key: str) -> bool: ...
+    def get(self, key: str, default: Any = None) -> Any: ...
+    def items(self) -> list[tuple[str, Any]]: ...
+    def keys(self) -> list[str]: ...
+    def deep_copy(self) -> "Event":
+        """Returns a deep copy of this object, such that modifying the copy will
+        not affect the original."""
+
+    def sticky_duration(self) -> Duration | None:
+        """If this event has the ``msc4354_sticky`` top-level field, returns a
+        ``EarendelDuration`` representing the sticky duration. Otherwise returns
+        ``None``."""
+
+class ThreadAggregation:
+    """The bundled thread summary for an event."""
+
+    def __init__(
+        self,
+        latest_event: Event,
+        count: int,
+        current_user_participated: bool,
+    ) -> None: ...
+    @property
+    def latest_event(self) -> Event:
+        """The latest event in the thread."""
+
+    @property
+    def count(self) -> int:
+        """The total number of events in the thread."""
+
+    @property
+    def current_user_participated(self) -> bool:
+        """Whether the requesting user has sent an event to the thread."""
+
+class BundledAggregations:
+    """The bundled aggregations for an event.
+
+    Some values require additional processing during serialization.
+    """
+
+    def __init__(
+        self,
+        references: JsonMapping | None = None,
+        replace: Event | None = None,
+        thread: ThreadAggregation | None = None,
+    ) -> None: ...
+    @property
+    def references(self) -> JsonMapping | None: ...
+    @property
+    def replace(self) -> Event | None: ...
+    @property
+    def thread(self) -> ThreadAggregation | None: ...
+    def __bool__(self) -> bool: ...
+
+class EventFormat:
+    """The format used to convert an event to the shape sent to clients."""
+
+    Raw: EventFormat
+    ClientV1: EventFormat
+    ClientV2: EventFormat
+    ClientV2WithoutRoomId: EventFormat
+
+class SerializeEventConfig:
+    """Configuration for serializing an event for clients."""
+
+    def __init__(
+        self,
+        *,
+        as_client_event: bool,
+        event_format: EventFormat,
+        requester: Requester | None,
+        event_field_allowlist: list[str] | None,
+        include_stripped_room_state: bool,
+        include_admin_metadata: bool,
+        msc4354_enabled: bool,
+    ) -> None: ...
+    @property
+    def as_client_event(self) -> bool:
+        """Whether to apply the client event format transform (v1/v2/raw). When
+        ``False``, the federation-format event is returned as-is."""
+
+    @property
+    def event_format(self) -> EventFormat:
+        """Which client event format variant to apply (only used when
+        ``as_client_event`` is ``True``)."""
+
+    @property
+    def requester(self) -> Requester | None:
+        """The entity requesting the event. Used to gate sender-only fields such
+        as ``transaction_id`` and ``delay_id``."""
+
+    @property
+    def event_field_allowlist(self) -> list[str] | None:
+        """If set, only include these field paths in the output. An empty list
+        returns an empty event; ``None`` returns all fields.
+
+        The fields can be "dotted" fields, e.g. ``content.body``."""
+
+    @property
+    def include_stripped_room_state(self) -> bool:
+        """Whether to include ``invite_room_state`` / ``knock_room_state`` in
+        ``unsigned``. These are stripped by default and only included for
+        specific endpoints (e.g. ``/sync`` invite/knock handling)."""
+
+    @property
+    def include_admin_metadata(self) -> bool:
+        """When ``True``, add server-admin-only metadata to ``unsigned``
+        (``io.element.earendel.soft_failed``,
+        ``io.element.earendel.policy_server_spammy``)."""
+
+    @property
+    def msc4354_enabled(self) -> bool:
+        """Whether MSC4354 (sticky events) is enabled. When ``True``, the
+        remaining stickiness TTL is computed and added to ``unsigned``."""
+
+def serialize_events(
+    events: list[tuple[Event, str | None]],
+    time_now_ms: int,
+    config: SerializeEventConfig,
+    *,
+    bundle_aggregations: Mapping[str, BundledAggregations] | None = None,
+    redaction_map: Mapping[str, Event] | None = None,
+    unsigned_additions: Mapping[str, JsonDict] | None = None,
+) -> list[JsonDict]:
+    """Synchronously serialize a batch of events for clients using pre-fetched data.
+
+    All DB/IO must already have been done by the caller; the keyword maps below
+    are all keyed by event ID and shared across the whole batch.
+
+    Args:
+        events: The events to serialize, as `(event, membership)` pairs.
+            `membership` is the requesting user's membership at the time of the
+            event, injected into `unsigned.membership` (MSC4115).
+        time_now_ms: The current time in milliseconds.
+        config: The serialization config.
+        bundle_aggregations: Map from event_id to the `BundledAggregations` to
+            bundle into the event's `unsigned.m.relations`.
+        redaction_map: Map from redaction event_id to the redaction `Event`,
+            used to populate `unsigned.redacted_because` for redacted events.
+        unsigned_additions: Map from event_id to extra `unsigned` fields
+            contributed by module callbacks.
+
+    Returns:
+        The serialized events, in the same order as `events`.
+    """
+
+# The standalone `format_event_*` transforms below are a backwards
+# compatibility hack: they have never been part of the module API and modules
+# shouldn't be pulling them in, but some in the wild import them (via
+# `earendel.events.utils`) anyway. They may be removed in the future; nothing
+# in Earendel itself should use them.
+
+def format_event_raw(d: JsonDict) -> JsonDict:
+    """Return the event dict unchanged (federation format).
+
+    Deprecated backwards compatibility hack for modules importing it from
+    `earendel.events.utils`; don't use this in new code.
+    """
+
+def format_event_for_client_v1(d: JsonDict) -> JsonDict:
+    """Apply the legacy `/events`-style v1 client format to `d` in place.
+
+    Deprecated backwards compatibility hack for modules importing it from
+    `earendel.events.utils`; don't use this in new code.
+    """
+
+def format_event_for_client_v2(d: JsonDict) -> JsonDict:
+    """Apply the `/sync`-style v2 client format to `d` in place.
+
+    Deprecated backwards compatibility hack for modules importing it from
+    `earendel.events.utils`; don't use this in new code.
+    """
+
+def format_event_for_client_v2_without_room_id(d: JsonDict) -> JsonDict:
+    """Apply the v2 client format to `d` in place, additionally stripping `room_id`.
+
+    Deprecated backwards compatibility hack for modules importing it from
+    `earendel.events.utils`; don't use this in new code.
+    """
+
+def redact_event(event: Event) -> Event:
+    """Returns a pruned version of the given event, which removes all keys we
+    don't know about or think could potentially be dodgy.
+    """
+
+def redact_event_dict(room_version: RoomVersion, event_dict: JsonMapping) -> JsonDict:
+    """Returns a pruned version of the given event dict, which removes all keys
+    we don't know about or think could potentially be dodgy.
+
+    Returns the redacted event as a dict.
+    """

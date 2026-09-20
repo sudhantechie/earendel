@@ -1,0 +1,86 @@
+# Copyright 2023 The Matrix.org Foundation C.I.C.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import typing
+
+from earendel.api.auth.mas import MasDelegatedAuth
+from earendel.api.errors import Codes, EarendelError
+from earendel.http.server import HttpServer
+from earendel.http.servlet import RestServlet
+from earendel.http.site import EarendelRequest
+from earendel.rest.client._base import client_patterns
+from earendel.types import JsonDict
+
+if typing.TYPE_CHECKING:
+    from earendel.server import HomeServer
+
+
+class AuthMetadataServlet(RestServlet):
+    """
+    Advertises the OAuth 2.0 server metadata for the homeserver.
+    """
+
+    PATTERNS = [
+        *client_patterns(
+            "/auth_metadata$",
+            releases=("v1",),
+        ),
+        *client_patterns(
+            "/org.matrix.msc2965/auth_metadata$",
+            unstable=True,
+            releases=(),
+        ),
+    ]
+
+    def __init__(self, hs: "HomeServer"):
+        super().__init__()
+        self._config = hs.config
+        self._auth = hs.get_auth()
+
+    async def on_GET(self, request: EarendelRequest) -> tuple[int, JsonDict]:
+        # This endpoint is unauthenticated and the response only depends on
+        # the metadata we get from Matrix Authentication Service. Internally,
+        # MasDelegatedAuth.issuer() is already caching the
+        # response in memory anyway. Ideally we would follow any Cache-Control directive
+        # given by MAS, but this is fine for now.
+        #
+        # - `public` means it can be cached both in the browser and in caching proxies
+        # - `max-age` controls how long we cache on the browser side. 10m is sane enough
+        # - `s-maxage` controls how long we cache on the proxy side. Since caching
+        #   proxies usually have a way to purge caches, it is fine to cache there for
+        #   longer (1h), and issue cache invalidations in case we need it
+        # - `stale-while-revalidate` allows caching proxies to serve stale content while
+        #   revalidating in the background. This is useful for making this request always
+        #   'snappy' to end users whilst still keeping it fresh
+        request.setHeader(
+            b"Cache-Control",
+            b"public, max-age=600, s-maxage=3600, stale-while-revalidate=600",
+        )
+
+        if self._config.mas.enabled:
+            assert isinstance(self._auth, MasDelegatedAuth)
+            return 200, await self._auth.auth_metadata()
+
+        else:
+            # Wouldn't expect this to be reached: the servlet shouldn't have been
+            # registered. Still, fail gracefully if we are registered for some reason.
+            raise EarendelError(
+                404,
+                "OIDC discovery has not been configured on this homeserver",
+                Codes.NOT_FOUND,
+            )
+
+
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
+    if hs.config.mas.enabled:
+        AuthMetadataServlet(hs).register(http_server)
