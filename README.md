@@ -1,4 +1,4 @@
-# earendel
+# Earendel
 
 Earendel is a private, self-hosted messaging platform for families and small
 close-knit groups who want complete ownership of their communications.
