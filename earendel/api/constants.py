@@ -19,7 +19,6 @@
 #
 # [This file includes modifications made by New Vector Limited]
 #
-#
 
 """Contains constants from the specification."""
 
